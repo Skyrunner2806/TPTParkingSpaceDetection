@@ -1,0 +1,110 @@
+# yolo_count_inframe_fast_real.py
+import os, glob, sys, time
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# =====================[ KONFIGURASI ]=====================
+VIDEO_PATH = r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\Labtek V.mp4"
+SPEED = 5.0          # 5.0 = 5x lebih cepat
+WEIGHTS = "yolov8n.pt"
+VEHICLE_CLASSES = {2}   # car, motorcycle, bus, truck
+CONF = 0.30
+IOU  = 0.50
+SHOW = True
+# =========================================================
+
+
+def resolve_source_path(path_or_dir):
+    if os.path.isfile(path_or_dir):
+        return path_or_dir
+    if os.path.isdir(path_or_dir):
+        for ext in ("*.mp4","*.avi","*.mov","*.mkv","*.m4v","*.wmv"):
+            files = sorted(glob.glob(os.path.join(path_or_dir, ext)))
+            if files:
+                return files[0]
+    return None
+
+
+def main():
+    src = resolve_source_path(VIDEO_PATH)
+    if src is None:
+        print(f"[ERROR] Tidak menemukan file video di: {VIDEO_PATH}")
+        sys.exit(1)
+    print(f"[INFO] Video: {src}")
+
+    cap = cv2.VideoCapture(src)
+    ok, frame = cap.read()
+    if not ok:
+        print("[ERROR] Gagal membaca frame pertama.")
+        sys.exit(1)
+
+    H, W = frame.shape[:2]
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+    if not fps_in or fps_in <= 0:
+        fps_in = 30.0
+
+    # tentukan seberapa banyak frame yang akan di-skip
+    skip_frames = max(1, int(round(SPEED)))
+    fps_out = int(fps_in)  # biar tetap playable
+
+    out_path = os.path.join(os.path.dirname(src), "hasil_counter_fast_real.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps_out, (W, H))
+    print(f"[INFO] Simpan hasil ke: {out_path} | fps_in={fps_in:.1f}, skip={skip_frames}")
+
+    model = YOLO(WEIGHTS)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    frame_idx, processed = 0, 0
+    t0 = time.time()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_idx += 1
+
+        # lewati frame untuk percepatan
+        if frame_idx % skip_frames != 0:
+            continue
+
+        # prediksi kendaraan di frame ini
+        results = model.predict(source=frame, imgsz=640, conf=CONF, iou=IOU, verbose=False)[0]
+
+        det = results.boxes
+        count_now = 0
+        if det is not None:
+            clss = det.cls.int().cpu().tolist() if det.cls is not None else []
+            xyxy = det.xyxy.cpu().numpy() if det.xyxy is not None else []
+            confs = det.conf.cpu().numpy().tolist() if det.conf is not None else []
+            for (box, c, cf) in zip(xyxy, clss, confs):
+                if c in VEHICLE_CLASSES:
+                    count_now += 1
+                    x1, y1, x2, y2 = box.astype(int)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                    cv2.putText(frame, f"{int(c)}:{cf:.2f}", (x1, max(0, y1-6)),
+                                font, 0.55, (0,255,0), 2, cv2.LINE_AA)
+
+        # tampilkan jumlah di frame
+        cv2.rectangle(frame, (10,10), (300,60), (0,0,0), -1)
+        cv2.putText(frame, f"VEHICLES: {count_now}", (18,45),
+                    font, 0.75, (0,255,255), 2, cv2.LINE_AA)
+
+        if SHOW:
+            cv2.imshow("YOLO - Fast Vehicle Counter", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+        writer.write(frame)
+        processed += 1
+
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+
+    print(f"[DONE] Frame diproses: {processed}, skip={skip_frames}, waktu {time.time()-t0:.1f}s")
+    print(f"[INFO] Hasil disimpan di: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
