@@ -1,0 +1,211 @@
+# parking_classifier_slots_webcam.py
+import cv2, json, time
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import pickle
+from skimage.transform import resize  # sama seperti saat training
+
+# ------------- SOURCE (WEBCAM) -------------
+CAM_INDEX    = 0   # 0 = webcam default. Ganti kalau kamu punya beberapa kamera
+
+# ---------------- PATHS ----------------
+SLOTS_JSON   = r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\slots2.json"
+OUT_DIR      = Path(r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\testing_classifier")
+OUT_VIDEO    = OUT_DIR / "annotated_classifier_webcam.mp4"
+OUT_CSV      = OUT_DIR / "occupancy_classifier_webcam.csv"
+MODEL_PATH   = r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\model.p"
+
+# -------------- PARAMS -----------------
+SHOW           = True
+INPUT_SIZE     = 15        # sama dengan (15, 15) waktu training
+FRAME_STEP     = 1       # proses setiap 10 frame
+DECISION_THR   = 0.50      # threshold untuk menentukan occupied dari decision_function
+ASSUMED_FPS    = 30.0      # kalau webcam tidak melaporkan FPS, pakai ini untuk CSV
+
+# --------------------------------------
+def ensure_outdir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def load_slots(json_path, video_shape_hw):
+    """Load polygon slot dan autoscale kalau ukuran JSON beda dengan frame webcam."""
+    H, W = video_shape_hw
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    slots_raw = data.get("slots", [])
+    meta_sz = data.get("meta", {}).get("image_size", [H, W])  # [H, W]
+    H0, W0 = int(meta_sz[0]), int(meta_sz[1])
+    sx, sy = W / max(1, W0), H / max(1, H0)
+
+    slots = []
+    for s in slots_raw:
+        pts0 = np.array(s["points"], dtype=np.float32)
+        pts = np.stack([pts0[:, 0] * sx, pts0[:, 1] * sy], axis=1).astype(np.int32)
+        sid = int(s.get("id", len(slots) + 1))
+        cx, cy = int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1]))
+        # bounding box dari poligon
+        x_min, y_min = pts[:, 0].min(), pts[:, 1].min()
+        x_max, y_max = pts[:, 0].max(), pts[:, 1].max()
+        slots.append({
+            "id": sid,
+            "points": pts,
+            "center": (cx, cy),
+            "bbox": (int(x_min), int(y_min), int(x_max), int(y_max))
+        })
+    return slots
+
+def crop_slot_patch(frame, slot, apply_mask=False):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = slot["bbox"]
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w - 1, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h - 1, y2))
+
+    patch = frame[y1:y2, x1:x2].copy()
+    if patch.size == 0:
+        return None
+
+    if apply_mask:
+        mask = np.zeros(patch.shape[:2], dtype=np.uint8)
+        pts = slot["points"].copy()
+        pts[:, 0] -= x1
+        pts[:, 1] -= y1
+        cv2.fillPoly(mask, [pts], 255)
+        patch[mask == 0] = 0
+
+    return patch
+
+def patch_to_features(patch):
+    patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+    patch_resized = resize(patch_rgb, (INPUT_SIZE, INPUT_SIZE), anti_aliasing=True)
+    return patch_resized.flatten()
+
+def predict_occupied(clf, patch):
+    """
+    Menggunakan decision_function:
+      score > DECISION_THR → occupied
+      score <= DECISION_THR → empty
+    """
+    if patch is None:
+        return False
+
+    feat = patch_to_features(patch)
+    score = clf.decision_function([feat])[0]
+    return score > DECISION_THR
+
+def main():
+    ensure_outdir(OUT_DIR)
+
+    # --------- buka webcam ----------
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise SystemExit(f"Gagal membuka webcam index {CAM_INDEX}")
+
+    # baca satu frame dulu untuk dapat ukuran
+    ok, frame = cap.read()
+    if not ok:
+        raise SystemExit("Gagal membaca frame pertama dari webcam.")
+    H, W = frame.shape[:2]
+
+    # coba baca FPS dari webcam, kalau 0/negatif → pakai ASSUMED_FPS
+    fps_cam = cap.get(cv2.CAP_PROP_FPS)
+    if not fps_cam or fps_cam <= 0:
+        FPS = ASSUMED_FPS
+    else:
+        FPS = fps_cam
+
+    print(f"[INFO] Webcam resolution: {W}x{H}, FPS (approx): {FPS:.1f}")
+
+    # siapkan writer
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(OUT_VIDEO), fourcc, FPS, (W, H))
+
+    # --------- load slots ----------
+    slots = load_slots(SLOTS_JSON, (H, W))
+    if not slots:
+        raise SystemExit("slots.json kosong—annotasi dulu slot parkirnya.")
+
+    # --------- load classifier ----------
+    print(f"[INFO] Load classifier dari: {MODEL_PATH}")
+    with open(MODEL_PATH, "rb") as f:
+        clf = pickle.load(f)
+
+    rows = []
+    frame_idx = 0
+
+    if SHOW:
+        cv2.namedWindow("Parking SVM Classifier (Webcam)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Parking SVM Classifier (Webcam)", min(W, 1280), min(H, 720))
+
+    t0 = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("[WARN] Gagal membaca frame dari webcam, stop.")
+            break
+        frame_idx += 1
+
+        # FRAME SKIPPING
+        if frame_idx % FRAME_STEP != 0:
+            # tetap bisa tulis frame mentah ke video kalau mau
+            writer.write(frame)
+            if SHOW:
+                cv2.imshow("Parking SVM Classifier (Webcam)", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+            continue
+
+        slot_taken = []
+        for s in slots:
+            patch = crop_slot_patch(frame, s, apply_mask=False)
+            occupied = predict_occupied(clf, patch)
+            slot_taken.append(occupied)
+
+        occupied_count = int(sum(slot_taken))
+
+        # gambar poligon slot
+        for i, s in enumerate(slots):
+            color = (0, 0, 255) if slot_taken[i] else (0, 200, 0)
+            cv2.polylines(frame, [s["points"]], True, color, 2)
+            cx, cy = s["center"]
+            cv2.putText(frame, str(s["id"]), (cx, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # header
+        cv2.rectangle(frame, (10, 10), (350, 60), (0, 0, 0), -1)
+        cv2.putText(frame,
+                    f"Occupied: {occupied_count}/{len(slots)}",
+                    (20, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        writer.write(frame)
+
+        if SHOW:
+            cv2.imshow("Parking SVM Classifier (Webcam)", frame)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                break
+
+        # waktu kira-kira untuk CSV (pakai FPS estimate)
+        row = {
+            "frame": frame_idx,
+            "time_s": round(frame_idx / FPS, 3),
+            "occupied": occupied_count,
+            "total_slots": len(slots)
+        }
+        for i, s in enumerate(slots):
+            row[f"slot_{s['id']}"] = int(slot_taken[i])
+        rows.append(row)
+
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+    pd.DataFrame(rows).to_csv(OUT_CSV, index=False)
+
+    print(f"[DONE] {frame_idx} frames in {time.time()-t0:.1f}s (approx)")
+    print(f"- Video : {OUT_VIDEO}")
+    print(f"- CSV   : {OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
